@@ -66,3 +66,19 @@ $ ./dlink client --endpoint <IP:PORT> --path <PATH> --reverse
 ![alt text](pic/image-8.png)
 
 ![alt text](pic/image-9.png)
+
+# Bidirectional synchronization
+
+Server:
+
+```
+$ ./dlink server --port 10098 --path /tmp/root &
+$ ./dlink server --port 10099 --path /tmp/root --reverse
+```
+
+Client:
+
+```
+$ ./dlink client --endpoint "<SERVER>:10098" --path /root &
+$ ./dlink client --endpoint "<SERVER>:10099" --path /root --reverse
+```
