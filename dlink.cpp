@@ -18,11 +18,24 @@
 #include <unordered_map>
 #include <chrono>
 #include <iomanip>
-
-
+#include <iostream>
+#include <openssl/aes.h>
+#include <openssl/rand.h>
+#include <vector>
+#include <sstream>
+#include <random>
+#include <openssl/err.h>
 namespace fs = boost::filesystem;
 using boost::asio::ip::tcp;
 using json = nlohmann::json;
+
+const std::string RESET  = "\033[0m";       
+const std::string RED    = "\033[31m";     
+const std::string GREEN  = "\033[32m";    
+const std::string YELLOW = "\033[33m";     
+const std::string BLUE   = "\033[34m";     
+const std::string ORANGE = "\033[38;5;214m";  
+  
 
 const char* ascii_art =  
 "\033[38;2;255;0;0m        ██████╗       ██╗     ██╗███╗   ██╗██╗  ██╗         \n"
@@ -38,8 +51,11 @@ const char* ascii_art =
 "\033[38;2;0;170;255m██║          ██║╚════╝██║          ██║╚════╝██║          ██║\n"
 "\033[38;2;0;85;255m███╗███████╗███║      ███╗███████╗███║      ███╗███████╗███║\n"
 "\033[38;2;0;0;255m╚══╝╚══════╝╚══╝      ╚══╝╚══════╝╚══╝      ╚══╝╚══════╝╚══╝\n"
-"\033[38;2;128;128;128m https://github.com/MartinxMax   Maptnh@S-H4CK13     Dlink-V1.0\033[0m\n";
+"\033[38;2;128;128;128m https://github.com/MartinxMax   Maptnh@S-H4CK13     Dlink-V2.0 For Linux\033[0m\n";
 
+std::string GLOBAL_KEY;
+const int PASSBIT = 8 ;
+const unsigned char DEFAULT_IV[16] = {14};  
 
 int sys_del(const std::string& del_path);
 void sync_ser(tcp::socket& socket, const std::string& path);
@@ -51,19 +67,202 @@ void download(const std::string& sys_path, const std::string& relative_path, siz
 void log_info(const std::string& message);
 int action_del(const std::string& hash, const std::string& file_path, tcp::socket& socket);
 std::string calculate_hash(const std::string& file_path);
+std::string encryptAES_CBC(const std::string& plaintext);
+std::string decryptAES_CBC(const std::vector<unsigned char>& ciphertext);
+std::vector<unsigned char> fromHexString(const std::string& hex) ;
+std::string toHexString(const std::vector<unsigned char>& data) ;
+std::string generateSecureRandomString();
+std::string jsonToString(const json& j, bool pretty = false);
+std::string normalizeKey(const std::string& key);
 json packet_query(const std::string& path);
+bool packet_auth(tcp::socket& socket);
 json action_query(const std::string& path, tcp::socket& socket);
 json filter_query(const std::string& dir_path, const json& client_query);
 bool parse_endpoint(const std::string& endpoint, std::string& ip, std::string& port);
+bool verify_auth(tcp::socket& socket);
+json read_data(tcp::socket& socket) ;
+bool write_data(tcp::socket& socket, const std::string& data);
 
 
- 
+
+std::string normalizeKey(const std::string& key) {
+    if (key.size() < 32) {
+        return key + std::string(32 - key.size(), '0'); 
+    } else {
+        return key.substr(0, 32);
+    }
+}
+
+
+bool packet_auth(tcp::socket& socket) {
+    json packet_authd = {{"auth", GLOBAL_KEY}};
+    write_data(socket, packet_authd.dump());
+	json status = read_data(socket);
+	if (status["status"] == "true") {
+		log_info("[SYNC-AUTH] Authentication successful");
+		return true;
+	} else {
+		log_info("[SYNC-AUTH] Authentication failed");
+		return false;
+	}
+}
+
+
+bool verify_auth(tcp::socket& socket) {
+    try {
+        json packet = read_data(socket); 
+        if (packet.contains("auth") && packet["auth"].is_string()) {
+            
+			if(packet["auth"] == GLOBAL_KEY){
+				json status = {{"status", "true"}};
+				write_data(socket, status.dump());
+			}else{
+				json status = {{"status", "false"}};
+				write_data(socket, status.dump());
+			}
+			 
+			return packet["auth"] == GLOBAL_KEY;
+        }
+    } catch (...) {
+        log_info("[ERROR] Authentication packet parsing failed.");
+    }
+    return false;  
+}
+
+
+std::string jsonToString(const json& j, bool pretty ) {
+    return pretty ? j.dump(4) : j.dump();
+}
+
+
+std::string generateSecureRandomString() {
+    const char charset[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                           "abcdefghijklmnopqrstuvwxyz"
+                           "0123456789";
+    const size_t maxIndex = sizeof(charset) - 2;
+
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<size_t> dist(0, maxIndex);
+
+    std::string randomStr;
+    randomStr.reserve(12);
+
+    for (int i = 0; i < 12; ++i) {
+        randomStr += charset[dist(gen)];
+    }
+    return randomStr;
+}
+
+
+std::string toHexString(const std::vector<unsigned char>& data) {
+    std::ostringstream oss;
+    for (unsigned char c : data) {
+        oss << std::hex << std::setw(2) << std::setfill('0') << (int)c;
+    }
+    return oss.str();
+}
+
+
+std::vector<unsigned char> fromHexString(const std::string& hex) {
+    if (hex.length() % 2 != 0) return {};
+    std::vector<unsigned char> data;
+    for (size_t i = 0; i < hex.length(); i += 2) {
+        unsigned int byte;
+        std::stringstream ss;
+        ss << std::hex << hex.substr(i, 2);
+        if (!(ss >> byte)) return {};
+        data.push_back(static_cast<unsigned char>(byte));
+    }
+    return data;
+}
+
+
+std::string encryptAES_CBC(const std::string& plaintext) {
+    std::string key = normalizeKey(GLOBAL_KEY);  
+    
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return "";
+
+    std::vector<unsigned char> encrypted(plaintext.size() + AES_BLOCK_SIZE);
+    int len = 0, ciphertext_len = 0;
+
+    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), nullptr, reinterpret_cast<const unsigned char*>(key.data()), DEFAULT_IV) != 1 ||
+        EVP_EncryptUpdate(ctx, encrypted.data(), &len, reinterpret_cast<const unsigned char*>(plaintext.data()), plaintext.size()) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        return "";
+    }
+    ciphertext_len += len;
+
+    if (EVP_EncryptFinal_ex(ctx, encrypted.data() + ciphertext_len, &len) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        return "";
+    }
+    ciphertext_len += len;
+
+    encrypted.resize(ciphertext_len);
+    EVP_CIPHER_CTX_free(ctx);
+    return toHexString(encrypted);
+}
+
+
+std::string decryptAES_CBC(const std::string& hexCiphertext) {
+    std::string key = normalizeKey(GLOBAL_KEY); 
+    
+    std::vector<unsigned char> ciphertext = fromHexString(hexCiphertext);
+    if (ciphertext.empty()) return "";
+
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return "";
+
+    std::vector<unsigned char> decrypted(ciphertext.size());
+    int len = 0, plaintext_len = 0;
+
+    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), nullptr, reinterpret_cast<const unsigned char*>(key.data()), DEFAULT_IV) != 1 ||
+        EVP_DecryptUpdate(ctx, decrypted.data(), &len, ciphertext.data(), ciphertext.size()) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        return "";
+    }
+    plaintext_len += len;
+
+    int ret = EVP_DecryptFinal_ex(ctx, decrypted.data() + plaintext_len, &len);
+    if (ret != 1) {
+        log_info("[ERROR] EVP_DecryptFinal_ex failed");
+        EVP_CIPHER_CTX_free(ctx);
+        return "";
+    }
+    plaintext_len += len;
+
+    decrypted.resize(plaintext_len);
+    EVP_CIPHER_CTX_free(ctx);
+
+    return std::string(decrypted.begin(), decrypted.end());
+}
+
+
 void log_info(const std::string& message) {
     auto now = std::chrono::system_clock::now();
     auto in_time_t = std::chrono::system_clock::to_time_t(now);
-    std::cout << "[" << std::put_time(std::localtime(&in_time_t), "%H:%M:%S") << "] "
-              << message << std::endl;
+    std::string color = RESET;
+    if (message.find("[ERROR]") == 0) {
+        color = RED;
+    } else if (message.find("[SYSTEM]") == 0) {
+        color = ORANGE;
+    } else if (message.find("[SYNC-AUTH]") == 0) {
+        color = YELLOW;
+    } else if (message.find("[SYNC]") == 0) {
+        color = YELLOW;
+    } else if (message.find("[SYNC-UPLOAD]") == 0) {
+        color = GREEN;
+    } else if (message.find("[SYNC-DOWNLOAD]") == 0) {
+        color = GREEN;
+    } else if (message.find("[SYNC-DELETE]") == 0) {
+        color = BLUE;
+    }
+    std::cout << color << "[" << std::put_time(std::localtime(&in_time_t), "%H:%M:%S") << "] "
+               << message << RESET << std::endl;
 }
+
 
 
 bool parse_endpoint(const std::string& endpoint, std::string& ip, std::string& port) {
@@ -76,6 +275,7 @@ bool parse_endpoint(const std::string& endpoint, std::string& ip, std::string& p
     port = endpoint.substr(colon_pos + 1);
     return true;
 }
+
 
 json filter_query(const std::string& dir_path, const json& client_query) {
 	json response;
@@ -99,6 +299,7 @@ json filter_query(const std::string& dir_path, const json& client_query) {
 	return response;
 }
 
+
 int action_del(const std::string& hash, const std::string& file_path, const std::string& base_path, tcp::socket& socket) {
 	try {
 		std::string relative_path = fs::relative(file_path, base_path).string();
@@ -115,12 +316,8 @@ int action_del(const std::string& hash, const std::string& file_path, const std:
 			}
 		}
 		;
-		std::string request = delpack.dump();
-		boost::asio::write(socket, boost::asio::buffer(request + "\r\n"));
-		char response_buf[1024];
-		size_t len = socket.read_some(boost::asio::buffer(response_buf));
-		std::string response_data(response_buf, len);
-		json status = json::parse(response_data);
+		write_data(socket,jsonToString(delpack,false));
+		json status = read_data(socket);
 		if (status["status"] == "true") {
 			return 401;
 		} else {
@@ -131,6 +328,7 @@ int action_del(const std::string& hash, const std::string& file_path, const std:
 		return 402;
 	}
 }
+
 
 std::string calculate_hash(const std::string& file_path) {
 	auto start_time = std::chrono::high_resolution_clock::now();
@@ -154,6 +352,7 @@ std::string calculate_hash(const std::string& file_path) {
 	std::chrono::duration<double> elapsed = end_time - start_time;
 	return hex_hash;
 }
+
 
 json packet_query(const std::string& base_path) {
 	json result;
@@ -181,16 +380,13 @@ json packet_query(const std::string& base_path) {
 	return result;
 }
 
+
 json action_query(const std::string& path, tcp::socket& socket) {
 	try {
 		json data = packet_query(path);
 		std::string request = data.dump();
-		boost::asio::write(socket, boost::asio::buffer(request+"\r\n"));
-		boost::asio::streambuf buffer;
-		boost::asio::read_until(socket, buffer, "}\r\n");
-		std::istream is(&buffer);
-		std::string response_data((std::istreambuf_iterator<char>(is)), std::istreambuf_iterator<char>());
-		json update = json::parse(response_data);
+		write_data(socket,request); 
+		json update = read_data(socket);
 		if (update.contains("update")) {
 			return update;
 		} else {
@@ -211,87 +407,90 @@ json action_query(const std::string& path, tcp::socket& socket) {
 	}
 }
 
+
 void upload(const json& update, tcp::socket& socket, const std::string& base_path) {
-	boost::asio::streambuf response_buffer;
-	std::istream response_stream(&response_buffer);
-	for (const auto& file : update["update"]) {
-		std::string relative_path = file["path"];
-		std::string full_path = (fs::path(base_path) / relative_path).string();
-		if (!fs::exists(full_path) || !fs::is_regular_file(full_path)) {
-            log_info("[ERROR] File does not exist:"+full_path);
-			continue;
-		}
-		std::ifstream in_file(full_path, std::ios::binary | std::ios::ate);
-		if (!in_file) {
-            log_info("[ERROR] Failed to open file:"+full_path);
-			continue;
-		}
-		size_t file_size = in_file.tellg();
-		in_file.close();
-		json upload_payload = { {
-				"upload", { { {
-							"path", relative_path
-						}
-						,  
-                        {
-							"hash", file["hash"]
-						}
-						, 
-                        {
-							"sizeof", file_size
-						}
-					}
-				}
-			}
-		}
-		;
-		std::string request = upload_payload.dump();
-		boost::asio::write(socket, boost::asio::buffer(request + "\r\n"));
-		boost::asio::read_until(socket, response_buffer, "\r\n");
-		std::string server_response;
-		std::getline(response_stream, server_response);
-		try {
-			json response_json = json::parse(server_response);
-			if (response_json["status"] != "true") {
-                log_info("[SYNC-UPLOAD] Server rejected file: "+relative_path);
-				continue;
-			}
-		}
-		catch (...) {
-            log_info("[SYNC-UPLOAD] Invalid server response, skipping file:"+relative_path);
-			continue;
-		}
-		std::ifstream file_stream(full_path, std::ios::binary);
-		if (!file_stream) {
-            log_info("[SYNC-UPLOAD] Failed to open file for sending:"+full_path);
-			continue;
-		}
-		std::vector<char> buffer(4096);
-		while (!file_stream.eof()) {
-			file_stream.read(buffer.data(), buffer.size());
-			std::streamsize bytes_read = file_stream.gcount();
-			boost::asio::write(socket, boost::asio::buffer(buffer.data(), bytes_read));
-		}
-		boost::asio::read_until(socket, response_buffer, "\r\n");
-		std::getline(response_stream, server_response);
-		try {
-			json response_json = json::parse(server_response);
-			if (response_json["status"] != "true") {
-                log_info("[SYNC-UPLOAD] Server reported error after receiving file:"+relative_path);
-				continue;
-			}
-		}
-		catch (...) {
-            log_info("[SYNC-UPLOAD] Invalid server response after file upload:"+relative_path);
-			continue;
-		}
-        log_info("[SYNC-UPLOAD] File sent successfully:"+relative_path);
+    for (const auto& file : update["update"]) {
+        std::string relative_path = file["path"];
+        std::string full_path = (fs::path(base_path) / relative_path).string();
+
+        if (!fs::exists(full_path) || !fs::is_regular_file(full_path)) {
+            log_info("[ERROR] File does not exist: " + full_path);
+            continue;
+        }
+
+        std::ifstream in_file(full_path, std::ios::binary | std::ios::ate);
+        if (!in_file) {
+            log_info("[ERROR] Failed to open file: " + full_path);
+            continue;
+        }
+
+        size_t file_size = in_file.tellg();
+        in_file.seekg(0, std::ios::beg);
+
+        json upload_payload = {
+            {"upload", {
+                {"path", relative_path},
+                {"hash", file["hash"]},
+                {"sizeof", file_size}
+            }}
+        };
+        write_data(socket, upload_payload.dump());
+
+        try {
+            json response_json = read_data(socket);
+            if (response_json["status"] != "true") {
+                log_info("[SYNC-UPLOAD] Server rejected file: " + relative_path);
+                continue;
+            }
+        } catch (...) {
+            log_info("[SYNC-UPLOAD] Invalid server response, skipping file: " + relative_path);
+            continue;
+        }
+
+        std::vector<char> buffer(65536);  
+        size_t total_sent = 0;
+
+        while (in_file.read(buffer.data(), buffer.size()) || in_file.gcount() > 0) {
+            std::streamsize bytes_read = in_file.gcount();
+            total_sent += bytes_read;
+
+            std::string encrypted_data = encryptAES_CBC(std::string(buffer.data(), bytes_read));
+
+            boost::asio::write(socket, boost::asio::buffer(encrypted_data));
+            double progress = (file_size > 0) ? (double)total_sent / file_size * 100.0 : 0;
+            double uploaded_mb = total_sent / (1024.0 * 1024.0);  
+            double total_mb = file_size / (1024.0 * 1024.0);    
+            std::cout << "\r" << GREEN << "[SYNC-UPLOAD] Progress: " 
+          << std::fixed << std::setprecision(2) << progress << "%  "
+          << "(" << uploaded_mb << "MB / " << total_mb << "MB)" 
+          << RESET << std::flush;
+        }
+        std::cout << "\n";
+        boost::asio::write(socket, boost::asio::buffer(":SD8A1"));
+
+        in_file.close();
+       
+        
+        try {
+            json response_json = read_data(socket);
+            if (response_json["status"] != "true") {
+                log_info("[SYNC-UPLOAD] Server reported error after receiving file: " + relative_path);
+                continue;
+            }
+        } catch (...) {
+            log_info("[SYNC-UPLOAD] Invalid server response after file upload: " + relative_path);
+            continue;
+        }
+
+        log_info("[SYNC-UPLOAD] File sent successfully: " + relative_path);
     }
+
     log_info("[SYNC-UPLOAD] All files sent successfully.");
 }
 
+
 void monitor_directory(const std::string& directory_path, tcp::socket& socket) {
-    std::unordered_map<std::string, std::string> file_hash_map;
+	std::unordered_map<std::string, std::string> file_hash_map;
     auto add_files_to_map = [&file_hash_map](const std::string& path) {
         for (const auto& entry : fs::recursive_directory_iterator(path)) {
             if (fs::is_regular_file(entry)) {
@@ -359,18 +558,19 @@ void monitor_directory(const std::string& directory_path, tcp::socket& socket) {
 }
 
 
-
 void start_client(const std::string& ip, const std::string& port, const std::string& directory_path, bool reverse) {
 	boost::asio::io_context io_context;
 	tcp::socket socket(io_context);
 	tcp::resolver resolver(io_context);
 	try {
 		boost::asio::connect(socket, resolver.resolve(ip, port));
+		
 		if (reverse) {
 			log_info("[SYSTEM] Reverse mode enabled");
 			sync_ser(socket,directory_path);
 		} else {
 			log_info("[SYSTEM] Forward mode enabled");
+            if (!packet_auth(socket)){return ;}
 			monitor_directory(directory_path, socket);
 		}
 	}
@@ -378,6 +578,7 @@ void start_client(const std::string& ip, const std::string& port, const std::str
         log_info("[ERROR] Client connection failed");
 	}
 }
+
 
 int sys_del(const std::string& del_path) {
 	namespace fs = std::filesystem;
@@ -397,118 +598,215 @@ int sys_del(const std::string& del_path) {
 	}
 }
 
-void download(const std::string& sys_path,const std::string& relative_path, size_t file_size, const std::string& expected_hash, tcp::socket& socket) {
-	try {
-		std::string save_path = (fs::path(sys_path) / relative_path).string();
-		fs::create_directories(fs::path(save_path).parent_path());
-		std::ofstream out_file(save_path, std::ios::binary);
-		if (!out_file) {
-			boost::asio::write(socket, boost::asio::buffer(json { {
-					"status", "false"
-				}
-			}
-			.dump() + "\r\n"));
-			return;
-		}
-		std::vector<char> buffer(4096);
-		size_t received_bytes = 0;
-		while (received_bytes < file_size) {
-			size_t remaining_bytes = file_size - received_bytes;
-			size_t read_size = std::min(buffer.size(), remaining_bytes);
-			boost::system::error_code error;
-			size_t bytes_read = socket.read_some(boost::asio::buffer(buffer.data(), read_size), error);
-			if (error) {
-				boost::asio::write(socket, boost::asio::buffer(json { {
-						"status", "false"
-					}
-				}
-				.dump() + "\r\n"));
-				return;
-			}
-			out_file.write(buffer.data(), bytes_read);
-			received_bytes += bytes_read;
-		}
-		out_file.close();
-		std::string received_hash = calculate_hash(save_path);
-		json response = (received_hash == expected_hash) ? json { {
-				"status", "true"
-			}
-		}
-		: json { {
-				"status", "false"
-			}
-		}
-		;
-		boost::asio::write(socket, boost::asio::buffer(response.dump() + "\r\n"));
-	}
-	catch (...) {
-		boost::asio::write(socket, boost::asio::buffer(json { {
-				"status", "false"
-			}
-		}
-		.dump() + "\r\n"));
-	}
+
+void download(const std::string& sys_path, const std::string& relative_path, size_t file_size, const std::string& expected_hash, tcp::socket& socket) {
+    try {
+        std::string save_path = (fs::path(sys_path) / relative_path).string();
+        fs::create_directories(fs::path(save_path).parent_path());
+
+        std::ofstream out_file(save_path, std::ios::binary);
+        if (!out_file) {
+            json response = {{"status", "false"}};
+            write_data(socket, response.dump());
+            return;
+        }
+
+        std::vector<char> buffer(65536); 
+        boost::system::error_code error;
+        std::string received_data;
+        size_t total_received = 0;
+
+        while (true) {
+            size_t bytes_read = socket.read_some(boost::asio::buffer(buffer), error);
+            if (error) {
+                log_info("[SYNC-DOWNLOAD] Network error while receiving file.");
+                json response = {{"status", "false"}};
+                write_data(socket, response.dump());
+                return;
+            }
+
+            received_data.append(buffer.data(), bytes_read);
+            total_received += bytes_read;
+
+            if (total_received > file_size) total_received = file_size;
+
+            double progress = (file_size > 0) ? (double)total_received / file_size * 100.0 : 0;
+            double received_mb = total_received / (1024.0 * 1024.0);
+            double total_mb = file_size / (1024.0 * 1024.0);
+
+            std::cout << "\r" << GREEN << "[SYNC-DOWNLOAD] Progress: " 
+          << std::fixed << std::setprecision(2) << progress << "%  "
+          << "(" << received_mb << "MB / " << total_mb << "MB)" 
+          << RESET << std::flush;
+
+            size_t pos = received_data.find(":SD8A1");
+            if (pos != std::string::npos) {
+                received_data = received_data.substr(0, pos);
+                break;
+            }
+        }
+
+        std::cout << "\n";
+
+        std::string decrypted_data = decryptAES_CBC(received_data);
+        if (decrypted_data.empty()) {
+            log_info("[SYNC-DOWNLOAD] Decryption failed for file: " + relative_path);
+            json response = {{"status", "false"}};
+            write_data(socket, response.dump());
+            return;
+        }
+
+        out_file.write(decrypted_data.data(), decrypted_data.size());
+        out_file.close();
+
+        std::string received_hash = calculate_hash(save_path);
+        json response = (received_hash == expected_hash) ? json{{"status", "true"}} : json{{"status", "false"}};
+        write_data(socket, response.dump());
+
+        if (received_hash == expected_hash) {
+            log_info("[SYNC-DOWNLOAD] File received successfully: " + save_path);
+        } else {
+            log_info("[SYNC-DOWNLOAD] Skip....");
+        }
+    }
+    catch (...) {
+        log_info("[SYNC-DOWNLOAD] Exception occurred during file transfer.");
+        json response = {{"status", "false"}};
+        write_data(socket, response.dump());
+    }
 }
 
+ 
+json read_data(tcp::socket& socket) {
+    boost::asio::streambuf buffer;
+    boost::system::error_code error;
+
+    try {
+        boost::asio::read_until(socket, buffer, ":SD8A1", error);
+
+        if (error && error != boost::asio::error::eof) {
+            log_info("[ERROR] Failed to read data");
+            if (socket.is_open()) {
+                boost::system::error_code ec;
+                socket.shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec);
+                socket.close(ec);
+            }
+
+            return {};
+        }
+
+        std::istream is(&buffer);
+        std::string encrypted_data((std::istreambuf_iterator<char>(is)), std::istreambuf_iterator<char>());
+
+        std::string delimiter = ":SD8A1";
+        size_t pos = encrypted_data.find(delimiter);
+        if (pos != std::string::npos) {
+            encrypted_data.erase(pos, delimiter.length());
+        }
+
+
+        std::string decrypted_data = decryptAES_CBC(encrypted_data);
+
+        if (decrypted_data.empty()) {
+            log_info("[ERROR] Failed to decrypt data");
+            if (socket.is_open()) {
+                boost::system::error_code ec;
+                socket.shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec);
+                socket.close(ec);
+            }
+
+            return {};
+        }
+
+        return json::parse(decrypted_data);
+
+    } catch (const json::exception& e) {
+        log_info("[ERROR] JSON parse error");
+    } catch (const std::exception& e) {
+        log_info("[ERROR] Unexpected error");
+    }
+
+    if (socket.is_open()) {
+        boost::system::error_code ec;
+        socket.shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec);
+        socket.close(ec);
+    }
+
+    return {};
+}
+
+
+bool write_data(tcp::socket& socket, const std::string& data) {
+    try {
+        if (!socket.is_open()) {
+            log_info("[ERROR] Attempted to write to closed socket.");
+            return false;  
+        }
+
+        std::string encrypted_data = encryptAES_CBC(data) + ":SD8A1";
+        boost::asio::write(socket, boost::asio::buffer(encrypted_data));
+        return true;  
+    } catch (const std::exception& e) {
+        log_info("[ERROR] Failed to send data: " + std::string(e.what()));
+        boost::system::error_code ec;
+        socket.shutdown(boost::asio::ip::tcp::socket::shutdown_both, ec);
+        socket.close(ec);
+
+        return false; 
+    }
+}
+
+
 void sync_ser(tcp::socket& socket, const std::string& path) {
+	
 	try {
-		while (true) {
-			boost::asio::streambuf buffer;
-			size_t bytes_read = boost::asio::read_until(socket, buffer, "}\r\n");
-			if (bytes_read == 0) {
-                log_info("[SYSTEM] The connection with the client has been aborted");
-				break;
-			}
-			std::istream is(&buffer);
-			std::string request_data((std::istreambuf_iterator<char>(is)), std::istreambuf_iterator<char>());
-			json data = json::parse(request_data);
+		if (!verify_auth(socket)) {
+            log_info("[SYNC-AUTH] Authentication failed");
+			return;
+		}
+        log_info("[SYNC-AUTH] Authentication successful");
+
+		while (socket.is_open()) {
+ 			 
+			json data = read_data(socket);
+		 
 			json response;
+
 			if (data.contains("query")) {
 				json update = filter_query(path, data);
 				response = update;
 			} else if (data.contains("upload")) {
-				response = json { {
-						"status", "true"
-					}
-				}
-				;
+				response = json{{"status", "true"}};
                 log_info("[SYNC-DOWNLOAD] Syncing files");
-				boost::asio::write(socket, boost::asio::buffer(response.dump() + "\r\n"));
-				download(path,data["upload"][0]["path"],data["upload"][0]["sizeof"],data["upload"][0]["hash"],socket);
+                if (!write_data(socket, response.dump())) { 
+                    break;
+                }
+				download(path, data["upload"]["path"], data["upload"]["sizeof"], data["upload"]["hash"], socket);
 				continue;
 			} else if (data.contains("delete")) {
 				std::string del_path = data["delete"][0]["path"];
-				int result = sys_del(path+'/'+del_path);
+				int result = sys_del(path + '/' + del_path);
 				if (result == 400) {
-					response = json { {
-							"status", "true"
-						}
-					}
-					;
-                    log_info("[SYNC-DELETE] Delete file successfully:"+del_path);
+					response = json{{"status", "true"}};
+                    log_info("[SYNC-DELETE] Deleted file successfully: " + del_path);
 				} else {
-					response = json { {
-							"status", "false"
-						}
-					}
-					;
+					response = json{{"status", "false"}};
+                    log_info("[SYNC-DELETE] Failed to delete file: " + del_path);
 				}
 			} else {
-				response = json { {
-						"status", "false"
-					}
-				};
-                log_info("[SYNC-DELETE] Failed to delete file");
+				response = json{{"status", "false"}};
+                log_info("[SYNC] Unknown request.");
 			}
-			std::string response_str = response.dump() + "\r\n";
-			boost::asio::write(socket, boost::asio::buffer(response_str));
+
+			write_data(socket, response.dump());
 		}
+	} catch (const std::exception& e) {
+        log_info("[ERROR] Server encountered an issue: " + std::string(e.what()));
 	}
-	catch (const std::exception& e) {
-        log_info(std::string("[ERROR] There was a problem with the server processing the message") + e.what());
-	}
-    log_info("[SYSTEM] The connection with the client has been aborted");
+
+    log_info("[SYSTEM] Connection with client has been closed.");
 }
+
 
 void start_server(const std::string& port,const std::string& directory_path,bool reverse) {
 	try {
@@ -527,6 +825,7 @@ void start_server(const std::string& port,const std::string& directory_path,bool
 			acceptor.accept(socket);
             log_info("[SYSTEM] D-link client connected...");
 			if (reverse) {
+                if (!packet_auth(socket)){return ;}
 				monitor_directory(directory_path, socket);
 			} else {
 				std::thread([sock = std::make_unique<tcp::socket>(std::move(socket)), path = std::move(directory_path)]() mutable {
@@ -541,16 +840,9 @@ void start_server(const std::string& port,const std::string& directory_path,bool
 	}
 }
 
+
 int main(int argc, char* argv[]) {
-    std::cout << ascii_art << std::endl;
-
-    if (argc < 4) {
-        std::cerr << "Usage:\n";
-        std::cerr << "  Client: " << argv[0] << " client --endpoint <IP:PORT> --path <DIR> [--reverse]\n";
-        std::cerr << "  Server: " << argv[0] << " server --port <PORT> --path <DIR> [--reverse]\n";
-        return 1;
-    }
-
+    std::cout << ascii_art<< std::endl;
     std::string mode = argv[1];
     std::string ip, port, path;
     bool reverse = false;
@@ -569,24 +861,45 @@ int main(int argc, char* argv[]) {
             path = argv[++i];
         } else if (arg == "--reverse") {
             reverse = true;
+        } else if (arg == "--key" && i + 1 < argc) {
+            GLOBAL_KEY = argv[++i];
+            if (GLOBAL_KEY.length() < PASSBIT) {
+                log_info( "[ERROR] Key must be at least "+std::to_string(PASSBIT)+" characters long");
+                return 1;
+            }
         } else {
-            log_info("[ERROR] Unknown argument:"+arg);
+            log_info( "[ERROR]  Unknown argument: "+arg+" characters long");
             return 1;
         }
     }
-
+     
     if (path.empty() || ((mode == "client" && (ip.empty() || port.empty())) || (mode == "server" && port.empty()))) {
-        log_info("[ERROR] Missing required arguments");
+        log_info( "[ERROR]  Missing required arguments");
         return 1;
     }
 
-    if (mode == "client") {
-        start_client(ip, port, path, reverse);
-    } else if (mode == "server") {
-        start_server(port, path, reverse);
-    } else {
-        log_info("[ERROR] Invalid mode");
-        return 1;
-    }
+	if (mode == "client") {
+		if (!reverse) {  
+			if (GLOBAL_KEY.empty() || GLOBAL_KEY.length() < PASSBIT) {
+				log_info("[ERROR] Use --key to provide a key > "+std::to_string(PASSBIT)+" characters");
+				return 0;
+			}
+		} else { 
+			if (GLOBAL_KEY.empty()) {
+				GLOBAL_KEY = generateSecureRandomString();
+			}  
+		}
+		log_info("[SYSTEM] Sync server key : ["+GLOBAL_KEY+"]");
+		start_client(ip, port, path, reverse);
+	} else if (mode == "server") {
+        if (GLOBAL_KEY.empty()) {
+            GLOBAL_KEY = generateSecureRandomString();
+        }  
+		log_info("[SYSTEM] Sync server key : ["+GLOBAL_KEY+"]");
+		start_server(port, path, reverse);
+	} else {
+		log_info("[ERROR] Invalid mode");
+		return 1;
+	}
     return 0;
 }
